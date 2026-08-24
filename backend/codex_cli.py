@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import re
+import signal
 import tempfile
 from pathlib import Path
 from typing import cast
@@ -29,6 +30,26 @@ _OUTPUT_SCHEMA: dict[str, object] = {
 
 _REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
 _TIMEOUT_SECONDS = 600
+_ENV_ALLOWLIST = {
+    "APPDATA",
+    "CODEX_HOME",
+    "COMSPEC",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOCALAPPDATA",
+    "PATH",
+    "PATHEXT",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "USERPROFILE",
+    "WINDIR",
+}
 
 _CLI_OUTPUT_INSTRUCTION = """
 # Codex CLI adapter override
@@ -103,14 +124,56 @@ class CodexCliError(Exception):
     pass
 
 
-async def _stop_process(process: asyncio.subprocess.Process) -> None:
-    if process.returncode is not None:
-        return
-    process.terminate()
+def _codex_environment() -> dict[str, str]:
+    return {key: value for key, value in os.environ.items() if key in _ENV_ALLOWLIST}
+
+
+def _process_group_exists(process_group_id: int) -> bool:
     try:
-        await asyncio.wait_for(process.wait(), timeout=2)
-    except asyncio.TimeoutError:
-        process.kill()
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+async def _stop_process(process: asyncio.subprocess.Process) -> None:
+    if os.name != "posix":
+        if process.returncode is not None:
+            return
+        process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+        return
+
+    process_group_id = process.pid
+    deadline = asyncio.get_running_loop().time() + 2
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+
+    if process.returncode is None:
+        remaining = max(0, deadline - asyncio.get_running_loop().time())
+        try:
+            await asyncio.wait_for(process.wait(), timeout=remaining)
+        except asyncio.TimeoutError:
+            pass
+
+    while (
+        _process_group_exists(process_group_id)
+        and asyncio.get_running_loop().time() < deadline
+    ):
+        await asyncio.sleep(0.05)
+
+    if _process_group_exists(process_group_id):
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if process.returncode is None:
         await process.wait()
 
 
@@ -133,7 +196,7 @@ async def run_codex_cli(
     model: str | None = None,
     reasoning_effort: str | None = None,
 ) -> str:
-    executable = Path(cli_path).expanduser()
+    executable = Path(cli_path).expanduser().resolve()
     if not executable.is_file() or not os.access(executable, os.X_OK):
         raise CodexCliError(
             "Codex CLI executable was not found. Set CODEX_CLI_PATH to a valid executable."
@@ -155,8 +218,20 @@ async def run_codex_cli(
             "--sandbox",
             "read-only",
             "--skip-git-repo-check",
+            "--ignore-user-config",
+            "--ignore-rules",
             "--color",
             "never",
+            "-c",
+            'approval_policy="never"',
+            "-c",
+            'shell_environment_policy.inherit="none"',
+            "-c",
+            "allow_login_shell=false",
+            "-c",
+            "features.multi_agent=false",
+            "-c",
+            "tools.web_search=false",
             "--output-schema",
             str(schema_path),
             "-C",
@@ -177,6 +252,8 @@ async def run_codex_cli(
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=_codex_environment(),
+                start_new_session=os.name == "posix",
             )
         except OSError as exc:
             raise CodexCliError(

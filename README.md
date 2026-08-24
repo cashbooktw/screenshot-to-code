@@ -60,7 +60,7 @@ optional and can be placed in `backend/.env`:
 | Variable | Purpose |
 |----------|---------|
 | `CODEX_CLI_PATH` | Explicit Codex executable path, for example `/opt/homebrew/bin/codex`. An invalid explicit path is an error; it does not fall back to another CLI or an API. |
-| `CODEX_MODEL` | Optional value passed to `codex exec --model`. If unset, the local Codex default is used. |
+| `CODEX_MODEL` | Optional value passed to `codex exec --model`. If unset, the Codex CLI built-in default is used. |
 | `CODEX_REASONING_EFFORT` | Optional effort: `minimal`, `low`, `medium`, `high`, or `xhigh`. |
 
 Run the backend (using Poetry for package management):
@@ -80,6 +80,12 @@ Codex CLI mode supports text or image creation and follow-up updates. It returns
 one complete HTML result and does not support video, asset extraction, image
 generation/editing, background removal, screenshot preview, app-specific tool
 events, or token-by-token HTML streaming.
+
+For isolation, each run uses a temporary workspace, a read-only sandbox, a
+minimal environment, and ignores user Codex config, MCP servers, plugins, and
+rules. Browser WebSocket connections are accepted only from localhost origins.
+Keep the backend bound to localhost and use it only with inputs you trust; this
+local integration is not a multi-user service or a general security boundary.
 
 Run the frontend:
 

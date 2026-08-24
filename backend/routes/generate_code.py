@@ -5,6 +5,7 @@ from datetime import datetime
 from abc import ABC, abstractmethod
 import traceback
 from typing import Callable, Awaitable
+from urllib.parse import urlparse
 from fastapi import APIRouter, WebSocket
 import openai
 from starlette.websockets import WebSocketDisconnect
@@ -84,6 +85,17 @@ from ws.constants import APP_ERROR_WEB_SOCKET_CODE  # type: ignore
 
 
 router = APIRouter()
+
+
+def _is_allowed_websocket_origin(origin: str | None) -> bool:
+    if not origin:
+        return True
+    parsed = urlparse(origin)
+    return parsed.scheme in {"http", "https"} and parsed.hostname in {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    }
 
 
 @dataclass
@@ -237,6 +249,18 @@ class WebSocketCommunicator:
             raise
         print("Received params")
         return params
+
+    async def wait_for_disconnect(self) -> None:
+        """Wait until the client closes the WebSocket."""
+        while not self.is_closed:
+            try:
+                message = await self.websocket.receive()
+            except WebSocketDisconnect:
+                self.is_closed = True
+                return
+            if message.get("type") == "websocket.disconnect":
+                self.is_closed = True
+                return
 
     async def close(self) -> None:
         """Close the WebSocket connection"""
@@ -755,6 +779,12 @@ class WebSocketSetupMiddleware(Middleware):
     async def process(
         self, context: PipelineContext, next_func: Callable[[], Awaitable[None]]
     ) -> None:
+        if not _is_allowed_websocket_origin(
+            context.websocket.headers.get("origin")
+        ):
+            await context.websocket.close(code=1008)
+            return
+
         # Create and setup WebSocket communicator
         context.ws_comm = WebSocketCommunicator(context.websocket)
         await context.ws_comm.accept()
@@ -856,10 +886,32 @@ class CodeGenerationMiddleware(Middleware):
                 generation_type=context.extracted_params.generation_type,
             )
 
-            context.variant_completions = await generation_stage.process_variants(
-                variant_models=context.variant_models,
-                prompt_messages=context.prompt_messages,
+            generation_task = asyncio.create_task(
+                generation_stage.process_variants(
+                    variant_models=context.variant_models,
+                    prompt_messages=context.prompt_messages,
+                )
             )
+            assert context.ws_comm is not None
+            disconnect_task = asyncio.create_task(
+                context.ws_comm.wait_for_disconnect()
+            )
+            try:
+                done, _ = await asyncio.wait(
+                    {generation_task, disconnect_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if generation_task in done:
+                    context.variant_completions = await generation_task
+                else:
+                    return
+            finally:
+                for task in (generation_task, disconnect_task):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    generation_task, disconnect_task, return_exceptions=True
+                )
 
             # Check if all variants failed
             if len(context.variant_completions) == 0:

@@ -4,7 +4,44 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from starlette.websockets import WebSocketDisconnect
 
-from routes.generate_code import WebSocketCommunicator
+from routes.generate_code import (
+    PipelineContext,
+    WebSocketCommunicator,
+    WebSocketSetupMiddleware,
+)
+
+
+@pytest.mark.asyncio
+async def test_websocket_setup_rejects_non_local_browser_origin() -> None:
+    websocket = MagicMock()
+    websocket.headers = {"origin": "https://attacker.example"}
+    websocket.accept = AsyncMock()
+    websocket.close = AsyncMock()
+    next_func = AsyncMock()
+
+    await WebSocketSetupMiddleware().process(
+        PipelineContext(websocket=cast(Any, websocket)), next_func
+    )
+
+    websocket.accept.assert_not_awaited()
+    websocket.close.assert_awaited_once_with(code=1008)
+    next_func.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_websocket_setup_allows_local_browser_origin() -> None:
+    websocket = MagicMock()
+    websocket.headers = {"origin": "http://127.0.0.1:5173"}
+    websocket.accept = AsyncMock()
+    websocket.close = AsyncMock()
+    next_func = AsyncMock()
+
+    await WebSocketSetupMiddleware().process(
+        PipelineContext(websocket=cast(Any, websocket)), next_func
+    )
+
+    websocket.accept.assert_awaited_once()
+    next_func.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -34,6 +71,23 @@ async def test_receive_params_marks_websocket_closed_on_disconnect() -> None:
         await communicator.receive_params()
 
     assert communicator.is_closed is True
+
+
+@pytest.mark.asyncio
+async def test_wait_for_disconnect_consumes_until_close_message() -> None:
+    websocket = MagicMock()
+    websocket.receive = AsyncMock(
+        side_effect=[
+            {"type": "websocket.receive", "text": "ignored"},
+            {"type": "websocket.disconnect", "code": 4001},
+        ]
+    )
+    communicator = WebSocketCommunicator(cast(Any, websocket))
+
+    await communicator.wait_for_disconnect()
+
+    assert communicator.is_closed is True
+    assert websocket.receive.await_count == 2
 
 
 @pytest.mark.asyncio

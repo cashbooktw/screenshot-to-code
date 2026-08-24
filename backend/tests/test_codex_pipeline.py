@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -5,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from openai.types.chat import ChatCompletionMessageParam
 
+from codex_cli import CodexCliError
 from llm import Llm
 from routes.generate_code import (
     AgenticGenerationStage,
@@ -57,9 +59,17 @@ async def test_code_generation_always_selects_one_codex_variant(
 
     context = PipelineContext(websocket=MagicMock())
     throw_error = AsyncMock()
+
+    async def never_disconnect() -> None:
+        await asyncio.Event().wait()
+
     context.ws_comm = cast(
         Any,
-        SimpleNamespace(send_message=AsyncMock(), throw_error=throw_error),
+        SimpleNamespace(
+            send_message=AsyncMock(),
+            throw_error=throw_error,
+            wait_for_disconnect=never_disconnect,
+        ),
     )
     context.extracted_params = _extracted_params()
     context.prompt_messages = [{"role": "user", "content": "Build a page"}]
@@ -71,6 +81,113 @@ async def test_code_generation_always_selects_one_codex_variant(
     assert context.completions == [expected_html]
     next_func.assert_awaited_once()
     throw_error.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_code_generation_cancels_when_websocket_disconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation_cancelled = False
+
+    async def wait_until_cancelled(
+        self: AgenticGenerationStage,
+        variant_models: list[Llm],
+        prompt_messages: list[ChatCompletionMessageParam],
+    ) -> dict[int, str]:
+        nonlocal generation_cancelled
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            generation_cancelled = True
+            raise
+        raise AssertionError("generation should have been cancelled")
+
+    monkeypatch.setattr(
+        AgenticGenerationStage, "process_variants", wait_until_cancelled
+    )
+    context = PipelineContext(websocket=MagicMock())
+    context.ws_comm = cast(
+        Any,
+        SimpleNamespace(
+            send_message=AsyncMock(),
+            throw_error=AsyncMock(),
+            wait_for_disconnect=AsyncMock(),
+        ),
+    )
+    context.extracted_params = _extracted_params()
+    context.prompt_messages = [{"role": "user", "content": "Build a page"}]
+    next_func = AsyncMock()
+
+    await asyncio.wait_for(
+        CodeGenerationMiddleware().process(context, next_func), timeout=0.5
+    )
+
+    assert generation_cancelled is True
+    next_func.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_code_generation_middleware_cancellation_cleans_up_child_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation_started = asyncio.Event()
+    monitor_started = asyncio.Event()
+    release = asyncio.Event()
+    generation_cancelled = False
+    monitor_cancelled = False
+
+    async def pending_generation(
+        self: AgenticGenerationStage,
+        variant_models: list[Llm],
+        prompt_messages: list[ChatCompletionMessageParam],
+    ) -> dict[int, str]:
+        nonlocal generation_cancelled
+        generation_started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            generation_cancelled = True
+            raise
+        return {}
+
+    async def pending_disconnect_monitor() -> None:
+        nonlocal monitor_cancelled
+        monitor_started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            monitor_cancelled = True
+            raise
+
+    monkeypatch.setattr(
+        AgenticGenerationStage, "process_variants", pending_generation
+    )
+    context = PipelineContext(websocket=MagicMock())
+    context.ws_comm = cast(
+        Any,
+        SimpleNamespace(
+            send_message=AsyncMock(),
+            throw_error=AsyncMock(),
+            wait_for_disconnect=pending_disconnect_monitor,
+        ),
+    )
+    context.extracted_params = _extracted_params()
+    context.prompt_messages = [{"role": "user", "content": "Build a page"}]
+
+    task = asyncio.create_task(
+        CodeGenerationMiddleware().process(context, AsyncMock())
+    )
+    await asyncio.gather(generation_started.wait(), monitor_started.wait())
+    task.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert generation_cancelled is True
+        assert monitor_cancelled is True
+    finally:
+        release.set()
+        await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio
@@ -145,4 +262,50 @@ async def test_codex_variant_bypasses_agent_and_records_unpriced_run(
         "variantComplete",
         "Variant generation complete",
         0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_variant_failure_records_and_sends_variant_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def failing_codex_cli(*args: Any, **kwargs: Any) -> str:
+        raise CodexCliError("Codex CLI is not logged in. Run `codex login`.")
+
+    recorder = MagicMock()
+    recorder.record_run_end = AsyncMock()
+    monkeypatch.setattr("routes.generate_code.run_codex_cli", failing_codex_cli)
+    monkeypatch.setattr("routes.generate_code.AgentRunRecorder", lambda **_: recorder)
+    monkeypatch.setattr("routes.generate_code.CODEX_CLI_PATH", "/custom/codex")
+
+    send_message = AsyncMock()
+    stage = AgenticGenerationStage(
+        send_message=send_message,
+        openai_api_key=None,
+        openai_base_url=None,
+        anthropic_api_key=None,
+        gemini_api_key=None,
+        replicate_api_key=None,
+        should_generate_images=False,
+        file_state=None,
+        asset_base_url="",
+        option_codes=[],
+    )
+
+    result = await stage._run_variant(
+        0,
+        Llm.CODEX_CLI,
+        [{"role": "user", "content": "Build a page"}],
+    )
+
+    assert result == ""
+    recorder.record_run_end.assert_awaited_once_with(
+        "failed", error="Codex CLI is not logged in. Run `codex login`."
+    )
+    send_message.assert_awaited_once_with(
+        "variantError",
+        "Codex CLI is not logged in. Run `codex login`.",
+        0,
+        None,
+        None,
     )
