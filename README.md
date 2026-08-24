@@ -15,7 +15,13 @@ Supported stacks:
 - Bootstrap
 - Ionic + Tailwind
 
-Default AI models:
+This fork's main UI uses your local Codex CLI and ChatGPT subscription for code
+generation. It does not call OpenAI, Anthropic, Gemini, or Replicate APIs.
+
+The upstream provider integrations are still present for eval and development
+tools, but `/generate-code` always runs one local Codex variant.
+
+Upstream AI models retained for those tools:
 
 - Gemini 3 Flash Preview and Gemini 3.1 Pro Preview - the best models
 - GPT-5.5 and GPT-5.4 Mini
@@ -24,7 +30,8 @@ Default AI models:
 
 See the [Examples](#-examples) section below for more demos.
 
-Screenshot to Code also supports taking a screen recording of a website in action and turning that into a functional prototype.
+The upstream app also supports screen recordings. Video input is not supported
+by this fork's Codex CLI mode.
 
 ![google in app quick 3](https://github.com/abi/screenshot-to-code/assets/23818/8758ffa4-9483-4b9b-bb66-abd6d1594c33)
 
@@ -35,50 +42,44 @@ Choose the path that fits what you want to do:
 - **Run locally:** best if you want to customize, self-host, or contribute.
 - **Use the hosted app:** the fastest way to try Screenshot to Code with no local setup. <a href="https://screenshottocode.com/?utm_source=github&utm_medium=readme&utm_campaign=oss_readme&utm_content=getting_started_cta" target="_blank" rel="noopener noreferrer">Open the hosted app →</a>
 
-Running locally requires API keys and a backend/frontend setup. The app has a React/Vite frontend and a FastAPI backend.
+Running locally requires the Codex CLI plus a backend/frontend setup. The app
+has a React/Vite frontend and a FastAPI backend.
 
-### API keys
+### Codex CLI
 
-You need **at least one** model provider key (OpenAI, Anthropic, or Gemini).
-**Gemini and Replicate are strongly recommended for the best quality of
-screenshot-to-code accuracy** — Gemini powers asset extraction (reusing the
-real logos/images from your screenshot) and Replicate powers image
-generation, background removal, and image editing. Adding all four keys gives
-the best results and lets you compare multiple models per generation.
+Install the [Codex CLI](https://developers.openai.com/codex/cli), then sign in
+with the ChatGPT account that has your Codex subscription:
 
-| Key | Required? | What it unlocks |
-|-----|-----------|-----------------|
-| `OPENAI_API_KEY` | One of these three | GPT code-gen variants (GPT-5.5, GPT-5.4 Mini) |
-| `ANTHROPIC_API_KEY` | One of these three | Claude code-gen variants (Opus 5, Opus 4.8, Fable 5, Sonnet 4.6) |
-| `GEMINI_API_KEY` | One of these three — **strongly recommended** | Gemini code-gen variants (3 Flash, 3.1 Pro); extracts real assets from the screenshot; required for video mode |
-| `REPLICATE_API_KEY` | **Strongly recommended** | Image editing, background removal, and Replicate-backed image generation — without it, `edit_images` and `remove_backgrounds` are unavailable |
+```bash
+codex login
+```
 
-With more keys, the app automatically picks a stronger mix of models per
-variant; with a single key it uses that provider's models only.
+The backend finds `codex` on `PATH` by default. These environment variables are
+optional and can be placed in `backend/.env`:
 
-If you'd like to run the app with Ollama open-source models (not recommended due to poor-quality results), [follow this comment](https://github.com/abi/screenshot-to-code/issues/354#issuecomment-2435479853).
+| Variable | Purpose |
+|----------|---------|
+| `CODEX_CLI_PATH` | Explicit Codex executable path, for example `/opt/homebrew/bin/codex`. An invalid explicit path is an error; it does not fall back to another CLI or an API. |
+| `CODEX_MODEL` | Optional value passed to `codex exec --model`. If unset, the local Codex default is used. |
+| `CODEX_REASONING_EFFORT` | Optional effort: `minimal`, `low`, `medium`, `high`, or `xhigh`. |
 
-Run the backend (I use Poetry for package management; run `pip install --upgrade poetry` if you don't have it):
+Run the backend (using Poetry for package management):
 
 ```bash
 cd backend
-echo "OPENAI_API_KEY=sk-your-key" > .env
-echo "ANTHROPIC_API_KEY=your-key" >> .env
-echo "GEMINI_API_KEY=your-key" >> .env
-echo "REPLICATE_API_KEY=r8_your-key" >> .env
+# Optional when codex is not already on PATH:
+echo "CODEX_CLI_PATH=/opt/homebrew/bin/codex" > .env
 poetry install
-# Install the Chromium browser used by the screenshot preview tool.
-# On Linux, use `poetry run playwright install --with-deps chromium` to also
-# install the required system libraries (needs sudo/apt).
-poetry run playwright install chromium
-poetry env activate
-# run the printed command, e.g. source /path/to/venv/bin/activate
 poetry run uvicorn main:app --reload --port 7001
 ```
 
-You can also set up OpenAI, Anthropic, and Gemini keys using the settings dialog in the frontend (click the gear icon after loading the app). Replicate must be configured in `backend/.env` as `REPLICATE_API_KEY`. The Settings dialog also shows whether **screenshot preview** is available on your backend.
+API keys entered in the frontend settings are ignored by `/generate-code`.
+Legacy providers and eval tools keep their existing API-key behavior.
 
-> **Screenshot preview** (optional) lets the agent render its own generated page in a headless browser and visually check its work. It's enabled automatically once Chromium is installed (the `playwright install chromium` step above, or automatically in the Docker image). If Chromium is missing, the app just skips the tool — the Settings dialog shows whether it's available.
+Codex CLI mode supports text or image creation and follow-up updates. It returns
+one complete HTML result and does not support video, asset extraction, image
+generation/editing, background removal, screenshot preview, app-specific tool
+events, or token-by-token HTML streaming.
 
 Run the frontend:
 
@@ -94,14 +95,9 @@ If you prefer to run the backend on a different port, update `VITE_WS_BACKEND_UR
 
 ## Docker
 
-If you have Docker installed, run this from the root directory:
-
-```bash
-echo "OPENAI_API_KEY=sk-your-key" > .env
-docker-compose up -d --build
-```
-
-The app will be up and running at http://localhost:5173. Note that you can't develop the application with this setup, as file changes won't trigger a rebuild.
+Codex CLI mode is not supported in Docker. Run the backend directly as the same
+OS user who ran `codex login`; the container does not contain the host Codex
+executable or its ChatGPT login state.
 
 ## 🙋‍♂️ FAQs
 

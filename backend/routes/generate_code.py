@@ -11,15 +11,18 @@ from starlette.websockets import WebSocketDisconnect
 from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 from config import (
     ANTHROPIC_API_KEY,
+    CODEX_CLI_PATH,
+    CODEX_MODEL,
+    CODEX_REASONING_EFFORT,
     GEMINI_API_KEY,
     IS_DEBUG_ENABLED,
     IS_PROD,
     NUM_VARIANTS,
-    NUM_VARIANTS_VIDEO,
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
     REPLICATE_API_KEY,
 )
+from codex_cli import run_codex_cli
 from custom_types import InputMode
 from llm import (
     Llm,
@@ -298,6 +301,10 @@ class ParameterExtractionStage:
             await self.throw_error(f"Invalid input mode: {input_mode}")
             raise ValueError(f"Invalid input mode: {input_mode}")
         validated_input_mode = cast(InputMode, input_mode)
+        if validated_input_mode == "video":
+            message = "Video input is not supported in Codex CLI mode."
+            await self.throw_error(message)
+            raise ValueError(message)
 
         openai_api_key = self._get_from_settings_dialog_or_env(
             params, "openAiApiKey", OPENAI_API_KEY
@@ -640,22 +647,48 @@ class AgenticGenerationStage:
                 input_mode=self.input_mode,
                 generation_type=self.generation_type,
             )
-            runner = Agent(
-                send_message=send_runner_message,
-                variant_index=index,
-                openai_api_key=self.openai_api_key,
-                openai_base_url=self.openai_base_url,
-                anthropic_api_key=self.anthropic_api_key,
-                gemini_api_key=self.gemini_api_key,
-                replicate_api_key=self.replicate_api_key,
-                should_generate_images=self.should_generate_images,
-                should_extract_assets=self.should_extract_assets,
-                asset_base_url=self.asset_base_url,
-                initial_file_state=self.file_state,
-                option_codes=self.option_codes,
-                recorder=recorder,
-            )
-            completion = await runner.run(model, prompt_messages)
+            if model == Llm.CODEX_CLI:
+                recorder.record_run_start(model, prompt_messages)
+                recorder.record_llm_request(
+                    "codex_cli",
+                    CODEX_MODEL or "codex-default",
+                    {
+                        "model": CODEX_MODEL,
+                        "reasoning_effort": CODEX_REASONING_EFFORT,
+                    },
+                )
+                try:
+                    completion = await run_codex_cli(
+                        prompt_messages,
+                        cli_path=CODEX_CLI_PATH or "",
+                        model=CODEX_MODEL,
+                        reasoning_effort=CODEX_REASONING_EFFORT,
+                    )
+                    recorder.record_llm_response(completion, [], None)
+                    recorder.record_set_code(len(completion), "codex_cli")
+                    await recorder.record_run_end(
+                        "completed", final_html=completion
+                    )
+                except BaseException as exc:
+                    await recorder.record_run_end("failed", error=str(exc))
+                    raise
+            else:
+                runner = Agent(
+                    send_message=send_runner_message,
+                    variant_index=index,
+                    openai_api_key=self.openai_api_key,
+                    openai_base_url=self.openai_base_url,
+                    anthropic_api_key=self.anthropic_api_key,
+                    gemini_api_key=self.gemini_api_key,
+                    replicate_api_key=self.replicate_api_key,
+                    should_generate_images=self.should_generate_images,
+                    should_extract_assets=self.should_extract_assets,
+                    asset_base_url=self.asset_base_url,
+                    initial_file_state=self.file_state,
+                    option_codes=self.option_codes,
+                    recorder=recorder,
+                )
+                completion = await runner.run(model, prompt_messages)
             if completion:
                 await self.send_message("setCode", completion, index, None, None)
             await self.send_message(
@@ -766,20 +799,9 @@ class StatusBroadcastMiddleware(Middleware):
     async def process(
         self, context: PipelineContext, next_func: Callable[[], Awaitable[None]]
     ) -> None:
-        # Determine variant count based on input mode and generation type.
-        # Edit/update flows use two variants to keep latency and cost down.
         assert context.extracted_params is not None
-        is_video_mode = context.extracted_params.input_mode == "video"
-        is_update = context.extracted_params.generation_type == "update"
-        num_variants = (
-            NUM_VARIANTS_VIDEO if is_video_mode else 2 if is_update else NUM_VARIANTS
-        )
-
-        # Tell frontend how many variants we're using
-        await context.send_message("variantCount", str(num_variants), 0)
-
-        for i in range(num_variants):
-            await context.send_message("status", "Generating code...", i)
+        await context.send_message("variantCount", "1", 0)
+        await context.send_message("status", "Generating code...", 0)
 
         await next_func()
 
@@ -807,15 +829,7 @@ class CodeGenerationMiddleware(Middleware):
         try:
             assert context.extracted_params is not None
 
-            # Select models (handles video mode internally)
-            model_selector = ModelSelectionStage(context.throw_error)
-            context.variant_models = await model_selector.select_models(
-                generation_type=context.extracted_params.generation_type,
-                input_mode=context.extracted_params.input_mode,
-                openai_api_key=context.extracted_params.openai_api_key,
-                anthropic_api_key=context.extracted_params.anthropic_api_key,
-                gemini_api_key=context.extracted_params.gemini_api_key,
-            )
+            context.variant_models = [Llm.CODEX_CLI]
             if IS_DEBUG_ENABLED:
                 await context.send_message(
                     "variantModels",
