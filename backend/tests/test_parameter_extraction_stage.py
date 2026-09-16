@@ -109,3 +109,22 @@ async def test_extracts_design_system_from_request() -> None:
     )
 
     assert extracted.design_system == "Reuse .mockup-frame"
+
+
+@pytest.mark.asyncio
+async def test_video_input_is_rejected_before_generation() -> None:
+    throw_error = AsyncMock()
+    stage = ParameterExtractionStage(throw_error)
+
+    with pytest.raises(ValueError, match="Video input is not supported"):
+        await stage.extract_and_validate(
+            {
+                "generatedCodeConfig": "html_tailwind",
+                "inputMode": "video",
+                "prompt": {"text": "Build from this video"},
+            }
+        )
+
+    throw_error.assert_awaited_once_with(
+        "Video input is not supported in Codex CLI mode."
+    )

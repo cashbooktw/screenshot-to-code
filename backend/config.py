@@ -1,4 +1,6 @@
 import os
+import shutil
+from collections.abc import Callable
 
 NUM_VARIANTS = 4
 NUM_VARIANTS_VIDEO = 2
@@ -8,6 +10,20 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", None)
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", None)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", None)
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", None)
+
+
+def resolve_codex_cli_path(
+    configured_path: str | None,
+    path_lookup: Callable[[str], str | None] = shutil.which,
+) -> str | None:
+    if configured_path and configured_path.strip():
+        return configured_path.strip()
+    return path_lookup("codex")
+
+
+CODEX_CLI_PATH = resolve_codex_cli_path(os.environ.get("CODEX_CLI_PATH"))
+CODEX_MODEL = os.environ.get("CODEX_MODEL") or None
+CODEX_REASONING_EFFORT = os.environ.get("CODEX_REASONING_EFFORT") or None
 
 # Image generation (optional)
 REPLICATE_API_KEY = os.environ.get("REPLICATE_API_KEY", None)

@@ -12,7 +12,7 @@ from routes.generate_code import (
 
 
 @pytest.mark.asyncio
-async def test_video_update_broadcasts_two_variants() -> None:
+async def test_text_create_broadcasts_one_variant() -> None:
     sent_messages: list[tuple[str, str | None, int]] = []
 
     async def send_message(
@@ -34,15 +34,15 @@ async def test_video_update_broadcasts_two_variants() -> None:
     )
     context.extracted_params = ExtractedParams(
         stack="html_tailwind",
-        input_mode="video",
+        input_mode="text",
         should_generate_images=True,
         openai_api_key=None,
         anthropic_api_key=None,
-        gemini_api_key="key",
+        gemini_api_key=None,
         replicate_api_key=None,
         openai_base_url=None,
-        generation_type="update",
-        prompt={"text": "Edit this video output", "images": [], "videos": []},
+        generation_type="create",
+        prompt={"text": "Build a page", "images": [], "videos": []},
         history=[],
         file_state=None,
         option_codes=[],
@@ -57,15 +57,15 @@ async def test_video_update_broadcasts_two_variants() -> None:
 
     await middleware.process(context, next_func)
 
-    assert sent_messages[0] == ("variantCount", "2", 0)
+    assert sent_messages[0] == ("variantCount", "1", 0)
     status_messages = [m for m in sent_messages if m[0] == "status"]
-    assert len(status_messages) == 2
-    assert [m[2] for m in status_messages] == [0, 1]
+    assert len(status_messages) == 1
+    assert [m[2] for m in status_messages] == [0]
     assert next_called is True
 
 
 @pytest.mark.asyncio
-async def test_image_update_broadcasts_two_variants() -> None:
+async def test_image_update_broadcasts_one_variant() -> None:
     sent_messages: list[tuple[str, str | None, int]] = []
 
     async def send_message(
@@ -110,8 +110,8 @@ async def test_image_update_broadcasts_two_variants() -> None:
 
     await middleware.process(context, next_func)
 
-    assert sent_messages[0] == ("variantCount", "2", 0)
+    assert sent_messages[0] == ("variantCount", "1", 0)
     status_messages = [m for m in sent_messages if m[0] == "status"]
-    assert len(status_messages) == 2
-    assert [m[2] for m in status_messages] == [0, 1]
+    assert len(status_messages) == 1
+    assert [m[2] for m in status_messages] == [0]
     assert next_called is True

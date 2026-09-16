@@ -5,21 +5,25 @@ from datetime import datetime
 from abc import ABC, abstractmethod
 import traceback
 from typing import Callable, Awaitable
+from urllib.parse import urlparse
 from fastapi import APIRouter, WebSocket
 import openai
 from starlette.websockets import WebSocketDisconnect
 from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 from config import (
     ANTHROPIC_API_KEY,
+    CODEX_CLI_PATH,
+    CODEX_MODEL,
+    CODEX_REASONING_EFFORT,
     GEMINI_API_KEY,
     IS_DEBUG_ENABLED,
     IS_PROD,
     NUM_VARIANTS,
-    NUM_VARIANTS_VIDEO,
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
     REPLICATE_API_KEY,
 )
+from codex_cli import run_codex_cli
 from custom_types import InputMode
 from llm import (
     Llm,
@@ -81,6 +85,17 @@ from ws.constants import APP_ERROR_WEB_SOCKET_CODE  # type: ignore
 
 
 router = APIRouter()
+
+
+def _is_allowed_websocket_origin(origin: str | None) -> bool:
+    if not origin:
+        return True
+    parsed = urlparse(origin)
+    return parsed.scheme in {"http", "https"} and parsed.hostname in {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    }
 
 
 @dataclass
@@ -235,6 +250,18 @@ class WebSocketCommunicator:
         print("Received params")
         return params
 
+    async def wait_for_disconnect(self) -> None:
+        """Wait until the client closes the WebSocket."""
+        while not self.is_closed:
+            try:
+                message = await self.websocket.receive()
+            except WebSocketDisconnect:
+                self.is_closed = True
+                return
+            if message.get("type") == "websocket.disconnect":
+                self.is_closed = True
+                return
+
     async def close(self) -> None:
         """Close the WebSocket connection"""
         if not self.is_closed:
@@ -298,6 +325,10 @@ class ParameterExtractionStage:
             await self.throw_error(f"Invalid input mode: {input_mode}")
             raise ValueError(f"Invalid input mode: {input_mode}")
         validated_input_mode = cast(InputMode, input_mode)
+        if validated_input_mode == "video":
+            message = "Video input is not supported in Codex CLI mode."
+            await self.throw_error(message)
+            raise ValueError(message)
 
         openai_api_key = self._get_from_settings_dialog_or_env(
             params, "openAiApiKey", OPENAI_API_KEY
@@ -640,22 +671,48 @@ class AgenticGenerationStage:
                 input_mode=self.input_mode,
                 generation_type=self.generation_type,
             )
-            runner = Agent(
-                send_message=send_runner_message,
-                variant_index=index,
-                openai_api_key=self.openai_api_key,
-                openai_base_url=self.openai_base_url,
-                anthropic_api_key=self.anthropic_api_key,
-                gemini_api_key=self.gemini_api_key,
-                replicate_api_key=self.replicate_api_key,
-                should_generate_images=self.should_generate_images,
-                should_extract_assets=self.should_extract_assets,
-                asset_base_url=self.asset_base_url,
-                initial_file_state=self.file_state,
-                option_codes=self.option_codes,
-                recorder=recorder,
-            )
-            completion = await runner.run(model, prompt_messages)
+            if model == Llm.CODEX_CLI:
+                recorder.record_run_start(model, prompt_messages)
+                recorder.record_llm_request(
+                    "codex_cli",
+                    CODEX_MODEL or "codex-default",
+                    {
+                        "model": CODEX_MODEL,
+                        "reasoning_effort": CODEX_REASONING_EFFORT,
+                    },
+                )
+                try:
+                    completion = await run_codex_cli(
+                        prompt_messages,
+                        cli_path=CODEX_CLI_PATH or "",
+                        model=CODEX_MODEL,
+                        reasoning_effort=CODEX_REASONING_EFFORT,
+                    )
+                    recorder.record_llm_response(completion, [], None)
+                    recorder.record_set_code(len(completion), "codex_cli")
+                    await recorder.record_run_end(
+                        "completed", final_html=completion
+                    )
+                except BaseException as exc:
+                    await recorder.record_run_end("failed", error=str(exc))
+                    raise
+            else:
+                runner = Agent(
+                    send_message=send_runner_message,
+                    variant_index=index,
+                    openai_api_key=self.openai_api_key,
+                    openai_base_url=self.openai_base_url,
+                    anthropic_api_key=self.anthropic_api_key,
+                    gemini_api_key=self.gemini_api_key,
+                    replicate_api_key=self.replicate_api_key,
+                    should_generate_images=self.should_generate_images,
+                    should_extract_assets=self.should_extract_assets,
+                    asset_base_url=self.asset_base_url,
+                    initial_file_state=self.file_state,
+                    option_codes=self.option_codes,
+                    recorder=recorder,
+                )
+                completion = await runner.run(model, prompt_messages)
             if completion:
                 await self.send_message("setCode", completion, index, None, None)
             await self.send_message(
@@ -722,6 +779,12 @@ class WebSocketSetupMiddleware(Middleware):
     async def process(
         self, context: PipelineContext, next_func: Callable[[], Awaitable[None]]
     ) -> None:
+        if not _is_allowed_websocket_origin(
+            context.websocket.headers.get("origin")
+        ):
+            await context.websocket.close(code=1008)
+            return
+
         # Create and setup WebSocket communicator
         context.ws_comm = WebSocketCommunicator(context.websocket)
         await context.ws_comm.accept()
@@ -766,20 +829,9 @@ class StatusBroadcastMiddleware(Middleware):
     async def process(
         self, context: PipelineContext, next_func: Callable[[], Awaitable[None]]
     ) -> None:
-        # Determine variant count based on input mode and generation type.
-        # Edit/update flows use two variants to keep latency and cost down.
         assert context.extracted_params is not None
-        is_video_mode = context.extracted_params.input_mode == "video"
-        is_update = context.extracted_params.generation_type == "update"
-        num_variants = (
-            NUM_VARIANTS_VIDEO if is_video_mode else 2 if is_update else NUM_VARIANTS
-        )
-
-        # Tell frontend how many variants we're using
-        await context.send_message("variantCount", str(num_variants), 0)
-
-        for i in range(num_variants):
-            await context.send_message("status", "Generating code...", i)
+        await context.send_message("variantCount", "1", 0)
+        await context.send_message("status", "Generating code...", 0)
 
         await next_func()
 
@@ -807,15 +859,7 @@ class CodeGenerationMiddleware(Middleware):
         try:
             assert context.extracted_params is not None
 
-            # Select models (handles video mode internally)
-            model_selector = ModelSelectionStage(context.throw_error)
-            context.variant_models = await model_selector.select_models(
-                generation_type=context.extracted_params.generation_type,
-                input_mode=context.extracted_params.input_mode,
-                openai_api_key=context.extracted_params.openai_api_key,
-                anthropic_api_key=context.extracted_params.anthropic_api_key,
-                gemini_api_key=context.extracted_params.gemini_api_key,
-            )
+            context.variant_models = [Llm.CODEX_CLI]
             if IS_DEBUG_ENABLED:
                 await context.send_message(
                     "variantModels",
@@ -842,10 +886,32 @@ class CodeGenerationMiddleware(Middleware):
                 generation_type=context.extracted_params.generation_type,
             )
 
-            context.variant_completions = await generation_stage.process_variants(
-                variant_models=context.variant_models,
-                prompt_messages=context.prompt_messages,
+            generation_task = asyncio.create_task(
+                generation_stage.process_variants(
+                    variant_models=context.variant_models,
+                    prompt_messages=context.prompt_messages,
+                )
             )
+            assert context.ws_comm is not None
+            disconnect_task = asyncio.create_task(
+                context.ws_comm.wait_for_disconnect()
+            )
+            try:
+                done, _ = await asyncio.wait(
+                    {generation_task, disconnect_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if generation_task in done:
+                    context.variant_completions = await generation_task
+                else:
+                    return
+            finally:
+                for task in (generation_task, disconnect_task):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    generation_task, disconnect_task, return_exceptions=True
+                )
 
             # Check if all variants failed
             if len(context.variant_completions) == 0:
